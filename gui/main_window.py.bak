@@ -1,0 +1,545 @@
+import os
+import sys
+from PyQt6.QtWidgets import (QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, 
+                             QPushButton, QLineEdit, QLabel, QProgressBar, QComboBox, 
+                             QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog,
+                             QMessageBox, QCheckBox, QTextEdit, QListWidget, QListWidgetItem)
+from PyQt6.QtCore import Qt, pyqtSignal, QThread
+from PyQt6.QtGui import QFont
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from core.downloader import Downloader
+from core.tagger import Tagger
+# from core.nicotine_integration import P2PManager  # Disabled for debugging
+from core.themes import get_stylesheet, get_theme_names
+import config
+
+class DownloadThread(QThread):
+    progress = pyqtSignal(float)
+    status = pyqtSignal(str)
+    finished = pyqtSignal()
+    
+    def __init__(self, url, audio_format, quality, cookies, embed_metadata=True, embed_lyrics=False):
+        super().__init__()
+        self.url = url
+        self.audio_format = audio_format
+        self.quality = quality
+        self.cookies = cookies
+        self.embed_metadata = embed_metadata
+        self.embed_lyrics = embed_lyrics
+        self.downloader = None
+    
+    def run(self):
+        self.downloader = Downloader(
+            progress_callback=self.progress.emit,
+            status_callback=self.status.emit
+        )
+        # Override download_tracks_threaded to pass metadata/lyrics flags
+        self._download_with_options()
+        self.finished.emit()
+    
+    def _download_with_options(self):
+        """Download tracks with metadata/lyrics options"""
+        def download_thread():
+            tracks = self.downloader.get_tracks_from_url(self.url)
+            if not tracks:
+                if self.downloader.status_callback:
+                    self.downloader.status_callback("No tracks found")
+                return
+            
+            os.makedirs(config.DOWNLOAD_DIR, exist_ok=True)
+            
+            for i, track in enumerate(tracks, 1):
+                if self.downloader.status_callback:
+                    self.downloader.status_callback(f"[{i}/{len(tracks)}] {track['name']} - {track['artist']}")
+                success, msg = self.downloader.download_track(
+                    track, config.DOWNLOAD_DIR, 
+                    self.audio_format, self.quality, 
+                    self.cookies, self.embed_metadata, self.embed_lyrics
+                )
+                if not success and self.downloader.status_callback:
+                    self.downloader.status_callback(f"Failed: {msg}")
+        
+        thread = threading.Thread(target=download_thread)
+        thread.daemon = True
+        thread.start()
+        # Don't join - let it run in background
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.downloader = Downloader(
+            progress_callback=self.update_progress,
+            status_callback=self.update_status
+        )
+        self.init_ui()
+        # self.load_files()  # Commented out for debugging
+    
+    def init_ui(self):
+        print("init_ui started...", file=sys.stderr)
+        self.setWindowTitle("NexusAudio - Downloader & Tag Editor")
+        self.setGeometry(100, 100, 1200, 800)
+        
+        print("Creating tabs widget...", file=sys.stderr)
+        # Central widget with tabs
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
+        
+        # Set current theme BEFORE creating tabs
+        print("Setting theme...", file=sys.stderr)
+        self.current_theme = config.THEME if hasattr(config, 'THEME') else 'Nexus Dark'
+        
+        # Create all tabs
+        print("Creating Downloader tab...", file=sys.stderr)
+        self.downloader_widget = QWidget()
+        self.tabs.addTab(self.downloader_widget, "Downloader")
+        self.init_downloader_tab()
+        
+        print("Creating Tag Editor tab...", file=sys.stderr)
+        self.tagger_widget = QWidget()
+        self.tabs.addTab(self.tagger_widget, "Tag Editor")
+        self.init_tagger_tab()
+        
+        print("Creating P2P tab...", file=sys.stderr)
+        self.p2p_widget = QWidget()
+        self.tabs.addTab(self.p2p_widget, "P2P (Soulseek)")
+        self.init_p2p_tab()
+        
+        print("Creating Settings tab...", file=sys.stderr)
+        self.settings_widget = QWidget()
+        self.tabs.addTab(self.settings_widget, "Settings")
+        self.init_settings_tab()
+        
+        # Apply default theme after tabs are created
+        print("Applying theme...", file=sys.stderr)
+        self.apply_theme(self.current_theme)
+    
+    def apply_theme(self, theme_name):
+        print(f"Applying theme: {theme_name}...", file=sys.stderr)
+        self.current_theme = theme_name
+        try:
+            stylesheet = get_stylesheet(theme_name)
+            self.setStyleSheet(stylesheet)
+            print("Theme applied!", file=sys.stderr)
+        except Exception as e:
+            print(f"Theme error: {e}", file=sys.stderr)
+        
+        # Downloader tab
+        self.downloader_widget = QWidget()
+        self.tabs.addTab(self.downloader_widget, "Downloader")
+        self.init_downloader_tab()
+        
+        # Tag Editor tab (puddletag style)
+        self.tagger_widget = QWidget()
+        self.tabs.addTab(self.tagger_widget, "Tag Editor")
+        self.init_tagger_tab()
+        
+        # P2P Tab (Soulseek/Nicotine+ based)
+        self.p2p_widget = QWidget()
+        self.tabs.addTab(self.p2p_widget, "P2P (Soulseek)")
+        self.init_p2p_tab()
+        
+        # Settings tab
+        self.settings_widget = QWidget()
+        self.tabs.addTab(self.settings_widget, "Settings")
+        self.init_settings_tab()
+        
+        # Initialize P2P manager (integrated Soulseek functionality) - disabled for now
+        self.p2p_manager = None
+    
+    def init_downloader_tab(self):
+        layout = QVBoxLayout()
+        
+        # URL input
+        url_layout = QHBoxLayout()
+        url_label = QLabel("Spotify URL:")
+        self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText("https://open.spotify.com/track/... or /playlist/...")
+        url_layout.addWidget(url_label)
+        url_layout.addWidget(self.url_input)
+        layout.addLayout(url_layout)
+        
+        # Options row
+        options_layout = QHBoxLayout()
+        
+        # Format selection
+        format_label = QLabel("Format:")
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(['mp3', 'flac', 'm4a', 'ogg'])
+        self.format_combo.currentTextChanged.connect(self.update_quality_options)
+        options_layout.addWidget(format_label)
+        options_layout.addWidget(self.format_combo)
+        
+        # Quality selection
+        quality_label = QLabel("Quality:")
+        self.quality_combo = QComboBox()
+        self.quality_combo.addItems(['64', '128', '192', '256', '320'])
+        self.quality_combo.setCurrentText('192')
+        options_layout.addWidget(quality_label)
+        options_layout.addWidget(self.quality_combo)
+        
+        # Cookies option
+        cookies_label = QLabel("Cookies:")
+        self.cookies_combo = QComboBox()
+        self.cookies_combo.addItems(['firefox', 'chrome', 'chromium', 'brave', 'edge', 'safari', 'none'])
+        self.cookies_combo.setCurrentText(config.COOKIES_BROWSER)
+        options_layout.addWidget(cookies_label)
+        options_layout.addWidget(self.cookies_combo)
+        
+        options_layout.addStretch()
+        layout.addLayout(options_layout)
+        
+        # Download button
+        self.download_btn = QPushButton("Download")
+        self.download_btn.clicked.connect(self.start_download)
+        layout.addWidget(self.download_btn)
+        
+        # Progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar)
+        
+        # Status label
+        self.status_label = QLabel("Ready")
+        layout.addWidget(self.status_label)
+        
+        layout.addStretch()
+        self.downloader_widget.setLayout(layout)
+    
+    def init_tagger_tab(self):
+        layout = QVBoxLayout()
+        
+        # Buttons row
+        btn_layout = QHBoxLayout()
+        refresh_btn = QPushButton("Refresh Files")
+        refresh_btn.clicked.connect(self.load_files)
+        rename_btn = QPushButton("Rename: Artist - Title")
+        rename_btn.clicked.connect(self.rename_files)
+        btn_layout.addWidget(refresh_btn)
+        btn_layout.addWidget(rename_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        
+        # Table (spreadsheet interface)
+        self.table = QTableWidget()
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels(['File', 'Title', 'Artist', 'Album', 'Genre', 'Year', 'Track#'])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.cellChanged.connect(self.on_cell_changed)
+        layout.addWidget(self.table)
+        
+        self.tagger_widget.setLayout(layout)
+    
+    def init_p2p_tab(self):
+        layout = QVBoxLayout()
+        
+        # Connection status (read-only display)
+        conn_layout = QHBoxLayout()
+        conn_layout.addWidget(QLabel("Status:"))
+        self.p2p_status_label = QLabel("Disconnected")
+        conn_layout.addWidget(self.p2p_status_label)
+        
+        self.connect_btn = QPushButton("Connect")
+        self.connect_btn.clicked.connect(self.toggle_p2p_connection)
+        conn_layout.addWidget(self.connect_btn)
+        conn_layout.addStretch()
+        layout.addLayout(conn_layout)
+    
+    def init_settings_tab(self):
+        layout = QVBoxLayout()
+        
+        # Info about embedded credentials
+        layout.addWidget(QLabel("Spotify API: Pre-configured and secured (embedded)"))
+        layout.addWidget(QLabel("Soulseek P2P: Configure your account below"))
+        
+        # Soulseek Registration Instructions
+        layout.addWidget(QLabel("How to get a Soulseek account:"))
+        info_text = QTextEdit()
+        info_text.setReadOnly(True)
+        info_text.setMaximumHeight(100)
+        info_text.setPlainText(
+            "1. Visit https://www.slsknet.org/news/register.php\n"
+            "2. Fill in username, password, and email\n"
+            "3. Wait for email confirmation (check spam folder)\n"
+            "4. Login with your new account in the P2P tab"
+        )
+        layout.addWidget(info_text)
+        
+        # Theme Settings
+        layout.addWidget(QLabel("Appearance:"))
+        theme_layout = QHBoxLayout()
+        theme_layout.addWidget(QLabel("Theme:"))
+        self.settings_theme = QComboBox()
+        self.settings_theme.addItems(get_theme_names())
+        self.settings_theme.setCurrentText(self.current_theme)
+        theme_layout.addWidget(self.settings_theme)
+        apply_theme_btn = QPushButton("Apply Theme")
+        apply_theme_btn.clicked.connect(self.apply_selected_theme)
+        theme_layout.addWidget(apply_theme_btn)
+        theme_layout.addStretch()
+        layout.addLayout(theme_layout)
+        
+        # Download Settings
+        layout.addWidget(QLabel("Download Settings:"))
+        download_layout = QVBoxLayout()
+        
+        folder_layout = QHBoxLayout()
+        folder_layout.addWidget(QLabel("Download Folder:"))
+        self.settings_folder = QLineEdit(config.DOWNLOAD_DIR)
+        folder_layout.addWidget(self.settings_folder)
+        folder_btn = QPushButton("Browse...")
+        folder_btn.clicked.connect(self.browse_folder)
+        folder_layout.addWidget(folder_btn)
+        download_layout.addLayout(folder_layout)
+        
+        cookies_layout = QHBoxLayout()
+        cookies_layout.addWidget(QLabel("Cookies Browser:"))
+        self.settings_cookies = QComboBox()
+        self.settings_cookies.addItems(['firefox', 'chrome', 'chromium', 'brave', 'edge', 'safari', 'none'])
+        self.settings_cookies.setCurrentText(config.COOKIES_BROWSER)
+        cookies_layout.addWidget(self.settings_cookies)
+        download_layout.addLayout(cookies_layout)
+        
+        # Metadata & Lyrics options
+        self.settings_metadata = QCheckBox("Embed metadata (ID3 tags)")
+        self.settings_metadata.setChecked(True)
+        download_layout.addWidget(self.settings_metadata)
+        
+        self.settings_lyrics = QCheckBox("Fetch and embed lyrics (MP3 only)")
+        self.settings_lyrics.setChecked(False)
+        download_layout.addWidget(self.settings_lyrics)
+        
+        layout.addLayout(download_layout)
+        
+        # Soulseek P2P Settings
+        layout.addWidget(QLabel("Soulseek P2P Configuration:"))
+        p2p_layout = QVBoxLayout()
+        
+        # Info about Soulseek
+        p2p_layout.addWidget(QLabel("Don't have an account? See instructions above."))
+        
+        p2p_user_layout = QHBoxLayout()
+        p2p_user_layout.addWidget(QLabel("Username:"))
+        self.settings_p2p_user = QLineEdit()
+        p2p_layout.addLayout(p2p_user_layout)
+        
+        p2p_pass_layout = QHBoxLayout()
+        p2p_pass_layout.addWidget(QLabel("Password:"))
+        self.settings_p2p_pass = QLineEdit()
+        self.settings_p2p_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        p2p_layout.addLayout(p2p_pass_layout)
+        
+        p2p_server_layout = QHBoxLayout()
+        p2p_server_layout.addWidget(QLabel("Server:"))
+        self.settings_p2p_server = QLineEdit("server.slsknet.org")
+        p2p_layout.addLayout(p2p_server_layout)
+        
+        p2p_port_layout = QHBoxLayout()
+        p2p_port_layout.addWidget(QLabel("Port:"))
+        self.settings_p2p_port = QLineEdit("2242")
+        p2p_layout.addLayout(p2p_port_layout)
+        
+        layout.addLayout(p2p_layout)
+        
+        # Save button
+        save_btn = QPushButton("Save Settings")
+        save_btn.clicked.connect(self.save_settings)
+        layout.addWidget(save_btn)
+        
+        layout.addStretch()
+        self.settings_widget.setLayout(layout)
+    
+    def browse_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Download Folder", config.DOWNLOAD_DIR)
+        if folder:
+            self.settings_folder.setText(folder)
+    
+    def save_settings(self):
+        # Update config
+        config.DOWNLOAD_DIR = self.settings_folder.text()
+        config.COOKIES_BROWSER = self.settings_cookies.currentText()
+        config.THEME = self.settings_theme.currentText()
+        
+        # Update P2P credentials
+        if self.p2p_manager:
+            self.p2p_manager.username = self.settings_p2p_user.text()
+            self.p2p_manager.password = self.settings_p2p_pass.text()
+        
+        # Save to config.py file (Spotify credentials remain embedded)
+        try:
+            with open('config.py', 'w') as f:
+                f.write(f"""import os
+
+# Spotify API credentials (embedded and secured)
+# To get your own: https://developer.spotify.com/dashboard
+_SPOTIFY_CLIENT_ID = '37aa5b3575e641848e7f18fbc36c9034'
+_SPOTIFY_CLIENT_SECRET = 'e6cae93d4ec94bdab4ce38c74b4d0853'
+
+# Public accessors (can be overridden via environment)
+SPOTIFY_CLIENT_ID = os.getenv('SPOTIFY_CLIENT_ID', _SPOTIFY_CLIENT_ID)
+SPOTIFY_CLIENT_SECRET = os.getenv('SPOTIFY_SECRET', _SPOTIFY_CLIENT_SECRET)
+DOWNLOAD_DIR = os.getenv('DOWNLOAD_DIR', '{config.DOWNLOAD_DIR}')
+COOKIES_BROWSER = os.getenv('COOKIES_BROWSER', '{config.COOKIES_BROWSER}')
+THEME = os.getenv('THEME', '{config.THEME}')
+
+# Security: Hide credentials from settings
+def get_spotify_creds():
+    \"\"\"Return embedded Spotify credentials\"\"\"
+    return _SPOTIFY_CLIENT_ID, _SPOTIFY_CLIENT_SECRET
+""")
+            QMessageBox.information(self, "Settings", "Settings saved successfully!")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to save settings: {e}")
+    
+    def apply_selected_theme(self):
+        theme_name = self.settings_theme.currentText()
+        self.apply_theme(theme_name)
+        config.THEME = theme_name
+        
+        # Search results
+        layout.addWidget(QLabel("Search Results:"))
+        self.p2p_results = QListWidget()
+        layout.addWidget(self.p2p_results)
+        
+        # Downloads
+        layout.addWidget(QLabel("Downloads:"))
+        self.p2p_downloads = QListWidget()
+        layout.addWidget(self.p2p_downloads)
+        
+        # Status
+        self.p2p_status = QTextEdit()
+        self.p2p_status.setMaximumHeight(100)
+        self.p2p_status.setReadOnly(True)
+        layout.addWidget(self.p2p_status)
+        
+        self.p2p_widget.setLayout(layout)
+    
+    def toggle_p2p_connection(self):
+        if not self.p2p_manager:
+            return
+        
+        if not self.p2p_manager.connected:
+            user = self.settings_p2p_user.text()
+            pwd = self.settings_p2p_pass.text()
+            server = self.settings_p2p_server.text()
+            try:
+                port = int(self.settings_p2p_port.text())
+            except:
+                port = 2242
+            
+            if not user or not pwd:
+                QMessageBox.warning(self, "Error", "Please enter Soulseek username and password in Settings")
+                return
+            
+            def connect_thread():
+                self.p2p_manager.connect(user, pwd, server, port)
+                self.p2p_status_label.setText("Connected" if self.p2p_manager.connected else "Disconnected")
+            
+            thread = threading.Thread(target=connect_thread)
+            thread.daemon = True
+            thread.start()
+            
+            self.connect_btn.setText("Disconnect")
+        else:
+            self.p2p_manager.disconnect()
+            self.connect_btn.setText("Connect")
+            self.p2p_status_label.setText("Disconnected")
+    
+    def p2p_search_files(self):
+        query = self.p2p_search.text().strip()
+        if not query:
+            return
+        
+        self.p2p_results.clear()
+        self.p2p_manager.search(query)
+    
+    def update_p2p_status(self, message):
+        self.p2p_status.append(message)
+    
+    def add_search_result(self, username, filename):
+        self.p2p_results.addItem(f"{username}: {filename}")
+    
+    def add_download(self, username, filename):
+        self.p2p_downloads.addItem(f"{username}: {filename}")
+    
+    def update_quality_options(self, format_text):
+        self.quality_combo.setEnabled(format_text == 'mp3')
+    
+    def start_download(self):
+        url = self.url_input.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Error", "Please enter a Spotify URL")
+            return
+        
+        audio_format = self.format_combo.currentText()
+        quality = self.quality_combo.currentText()
+        cookies = self.cookies_combo.currentText()
+        if cookies == 'none':
+            cookies = None
+        
+        embed_metadata = self.settings_metadata.isChecked() if hasattr(self, 'settings_metadata') else True
+        embed_lyrics = self.settings_lyrics.isChecked() if hasattr(self, 'settings_lyrics') else False
+        
+        self.download_btn.setEnabled(False)
+        self.status_label.setText("Starting download...")
+        
+        self.download_thread = DownloadThread(url, audio_format, quality, cookies, embed_metadata, embed_lyrics)
+        self.download_thread.progress.connect(self.update_progress)
+        self.download_thread.status.connect(self.update_status)
+        self.download_thread.finished.connect(self.download_finished)
+        self.download_thread.start()
+    
+    def update_progress(self, value):
+        self.progress_bar.setValue(int(value))
+    
+    def update_status(self, message):
+        self.status_label.setText(message)
+    
+    def download_finished(self):
+        self.download_btn.setEnabled(True)
+        self.status_label.setText("Download complete!")
+        self.load_files()
+    
+    def load_files(self):
+        self.table.setRowCount(0)
+        files = Tagger.get_supported_files(config.DOWNLOAD_DIR)
+        
+        for filepath in files:
+            tags = Tagger.read_tags(filepath)
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            
+            self.table.setItem(row, 0, QTableWidgetItem(tags.get('filename', '')))
+            self.table.setItem(row, 1, QTableWidgetItem(tags.get('title', '')))
+            self.table.setItem(row, 2, QTableWidgetItem(tags.get('artist', '')))
+            self.table.setItem(row, 3, QTableWidgetItem(tags.get('album', '')))
+            self.table.setItem(row, 4, QTableWidgetItem(tags.get('genre', '')))
+            self.table.setItem(row, 5, QTableWidgetItem(tags.get('year', '')))
+            self.table.setItem(row, 6, QTableWidgetItem(tags.get('tracknumber', '')))
+            
+            # Store filepath in first item
+            self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, filepath)
+    
+    def on_cell_changed(self, row, column):
+        if column < 1:
+            return
+        
+        filepath = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+        if not filepath:
+            return
+        
+        tag_map = {1: 'title', 2: 'artist', 3: 'album', 4: 'genre', 5: 'year', 6: 'tracknumber'}
+        tag_name = tag_map.get(column)
+        new_value = self.table.item(row, column).text()
+        
+        tags = {tag_name: new_value}
+        Tagger.write_tags(filepath, tags)
+    
+    def rename_files(self):
+        for row in range(self.table.rowCount()):
+            filepath = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+            if filepath:
+                Tagger.rename_to_artist_title(filepath)
+        self.load_files()
